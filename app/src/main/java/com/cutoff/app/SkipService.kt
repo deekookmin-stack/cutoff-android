@@ -51,7 +51,7 @@ class SkipService : Service() {
             running = true
             wake = (getSystemService(Context.POWER_SERVICE) as PowerManager)
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "cutoff:loop")
-            wake?.acquire()
+                .apply { setReferenceCounted(false) }
             worker = Thread { loop() }.also { it.start() }
         }
         return START_NOT_STICKY
@@ -61,10 +61,20 @@ class SkipService : Service() {
         running = false
         worker?.interrupt()
         worker = null
-        if (wake?.isHeld == true) wake?.release()
+        hold(false)
         Spotify.init(this)
         Spotify.status = "Stopped"
         super.onDestroy()
+    }
+
+    // Keep the processor awake only while a song is actually playing.
+    private fun hold(on: Boolean) {
+        val w = wake ?: return
+        if (on) {
+            w.acquire(10 * 60 * 1000L)
+        } else if (w.isHeld) {
+            w.release()
+        }
     }
 
     private fun setStatus(s: String) {
@@ -75,22 +85,28 @@ class SkipService : Service() {
 
     private fun loop() {
         var skippedId: String? = null
+        var idleSince = System.currentTimeMillis()
         while (running) {
-            var sleep = 2000L
+            var sleep = 10000L
+            var active = false
             try {
                 val r = Spotify.api("GET", "/me/player")
                 when (r.code) {
-                    204 -> setStatus("No active Spotify device. Start playing a song.")
+                    204 -> {
+                        setStatus("No active Spotify device. Start playing a song.")
+                        sleep = 15000L
+                    }
                     429 -> sleep = r.retryAfter * 1000L
                     401 -> {
                         setStatus("Login expired. Disconnect and connect again.")
-                        sleep = 5000L
+                        sleep = 15000L
                     }
                     200 -> {
                         val j = JSONObject(r.body)
                         val item = j.optJSONObject("item")
                         if (item == null) {
                             setStatus("Nothing playing")
+                            sleep = 15000L
                         } else {
                             val id = item.optString("uri")
                             val name = item.optString("name")
@@ -103,42 +119,59 @@ class SkipService : Service() {
                             }
                             if (!playing) {
                                 setStatus("Spotify is paused")
-                            } else if (id == skippedId) {
-                                setStatus("Skipping…")
+                                sleep = 10000L
                             } else {
-                                val remaining = cut - pos
-                                if (remaining <= 400) {
-                                    val s = Spotify.api("POST", "/me/player/next")
-                                    when (s.code) {
-                                        200, 204 -> {
-                                            skippedId = id
-                                            Spotify.lastSkip = "Last skip: $name"
-                                            sleep = 800L
-                                        }
-                                        403 -> {
-                                            setStatus("Spotify Premium is required to skip.")
-                                            sleep = 5000L
-                                        }
-                                        404 -> {
-                                            setStatus("No active Spotify device.")
-                                            sleep = 5000L
-                                        }
-                                        429 -> sleep = s.retryAfter * 1000L
-                                        else -> sleep = 2000L
-                                    }
+                                active = true
+                                idleSince = System.currentTimeMillis()
+                                if (id == skippedId) {
+                                    setStatus("Skipping…")
+                                    sleep = 1000L
                                 } else {
-                                    setStatus("Watching: $name (skips at ${fmt(cut)})")
-                                    sleep = minOf(2000L, remaining - 300)
+                                    val remaining = cut - pos
+                                    if (remaining <= 400) {
+                                        val s = Spotify.api("POST", "/me/player/next")
+                                        when (s.code) {
+                                            200, 204 -> {
+                                                skippedId = id
+                                                Spotify.lastSkip = "Last skip: $name"
+                                                sleep = 800L
+                                            }
+                                            403 -> {
+                                                setStatus("Spotify Premium is required to skip.")
+                                                sleep = 10000L
+                                            }
+                                            404 -> {
+                                                setStatus("No active Spotify device.")
+                                                sleep = 10000L
+                                            }
+                                            429 -> sleep = s.retryAfter * 1000L
+                                            else -> sleep = 2000L
+                                        }
+                                    } else {
+                                        setStatus("Watching: $name (skips at ${fmt(cut)})")
+                                        // Check again just before the cutoff, otherwise every 10s.
+                                        sleep = if (remaining > 10300L) 10000L
+                                        else maxOf(200L, remaining - 300L)
+                                    }
                                 }
                             }
                         }
                     }
-                    else -> sleep = 3000L
+                    else -> sleep = 5000L
                 }
             } catch (e: Exception) {
                 setStatus("Connection problem. Retrying…")
-                sleep = 4000L
+                sleep = 5000L
             }
+
+            hold(active)
+
+            if (!active && System.currentTimeMillis() - idleSince > 30 * 60 * 1000L) {
+                Spotify.lastSkip = "Stopped automatically after 30 minutes without music."
+                stopSelf()
+                break
+            }
+
             try {
                 Thread.sleep(sleep)
             } catch (e: InterruptedException) {

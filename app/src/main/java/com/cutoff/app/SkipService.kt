@@ -12,6 +12,9 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class SkipService : Service() {
 
@@ -22,6 +25,7 @@ class SkipService : Service() {
 
     private var worker: Thread? = null
     private var wake: PowerManager.WakeLock? = null
+    private val clock = SimpleDateFormat("h:mm:ss a", Locale.getDefault())
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -47,6 +51,10 @@ class SkipService : Service() {
         } else {
             startForeground(1, n)
         }
+        if (intent == null) {
+            // The system killed the service and brought it back.
+            Spotify.lastSkip = "Restarted by the system at ${clock.format(Date())}"
+        }
         if (worker == null) {
             running = true
             wake = (getSystemService(Context.POWER_SERVICE) as PowerManager)
@@ -54,7 +62,7 @@ class SkipService : Service() {
                 .apply { setReferenceCounted(false) }
             worker = Thread { loop() }.also { it.start() }
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     override fun onDestroy() {
@@ -77,8 +85,10 @@ class SkipService : Service() {
         }
     }
 
+    private fun now() = clock.format(Date())
+
     private fun setStatus(s: String) {
-        if (Spotify.status != s) Spotify.status = s
+        Spotify.status = s + "\nChecked " + now()
     }
 
     private fun fmt(ms: Long) = "%d:%02d".format(ms / 60000, (ms / 1000) % 60)
@@ -90,11 +100,11 @@ class SkipService : Service() {
             var sleep = 10000L
             var active = false
             try {
-                val r = Spotify.api("GET", "/me/player")
+                val r = Spotify.api("GET", "/me/player?additional_types=episode")
                 when (r.code) {
                     204 -> {
-                        setStatus("No active Spotify device. Start playing a song.")
-                        sleep = 15000L
+                        setStatus("Spotify isn't reporting an active device. Open Spotify and play a song.")
+                        sleep = 10000L
                     }
                     429 -> sleep = r.retryAfter * 1000L
                     401 -> {
@@ -104,15 +114,23 @@ class SkipService : Service() {
                     200 -> {
                         val j = JSONObject(r.body)
                         val item = j.optJSONObject("item")
+                        val type = j.optString("currently_playing_type")
+                        val playing = j.optBoolean("is_playing")
                         if (item == null) {
-                            setStatus("Nothing playing")
-                            sleep = 15000L
+                            if (type == "ad" && playing) {
+                                active = true
+                                idleSince = System.currentTimeMillis()
+                                setStatus("An ad is playing")
+                                sleep = 5000L
+                            } else {
+                                setStatus("Nothing playing")
+                                sleep = 10000L
+                            }
                         } else {
                             val id = item.optString("uri")
                             val name = item.optString("name")
                             val dur = item.optLong("duration_ms")
                             val pos = j.optLong("progress_ms")
-                            val playing = j.optBoolean("is_playing")
                             val cut = dur * Spotify.percent / 100
                             if (skippedId != null && (skippedId != id || pos < cut - 3000)) {
                                 skippedId = null
@@ -133,7 +151,7 @@ class SkipService : Service() {
                                         when (s.code) {
                                             200, 204 -> {
                                                 skippedId = id
-                                                Spotify.lastSkip = "Last skip: $name"
+                                                Spotify.lastSkip = "Last skip: $name (${now()})"
                                                 sleep = 800L
                                             }
                                             403 -> {
@@ -149,7 +167,6 @@ class SkipService : Service() {
                                         }
                                     } else {
                                         setStatus("Watching: $name (skips at ${fmt(cut)})")
-                                        // Check again just before the cutoff, otherwise every 10s.
                                         sleep = if (remaining > 10300L) 10000L
                                         else maxOf(200L, remaining - 300L)
                                     }
@@ -157,7 +174,10 @@ class SkipService : Service() {
                             }
                         }
                     }
-                    else -> sleep = 5000L
+                    else -> {
+                        setStatus("Spotify replied with code ${r.code}")
+                        sleep = 5000L
+                    }
                 }
             } catch (e: Exception) {
                 setStatus("Connection problem. Retrying…")
@@ -166,8 +186,8 @@ class SkipService : Service() {
 
             hold(active)
 
-            if (!active && System.currentTimeMillis() - idleSince > 30 * 60 * 1000L) {
-                Spotify.lastSkip = "Stopped automatically after 30 minutes without music."
+            if (!active && System.currentTimeMillis() - idleSince > 2 * 60 * 60 * 1000L) {
+                Spotify.lastSkip = "Stopped automatically after 2 hours without music."
                 stopSelf()
                 break
             }

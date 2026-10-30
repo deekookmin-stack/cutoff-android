@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -17,12 +18,14 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 
 class MainActivity : Activity() {
 
     private val ui = Handler(Looper.getMainLooper())
+    private lateinit var accessBox: LinearLayout
     private lateinit var setup: LinearLayout
     private lateinit var main: LinearLayout
     private lateinit var idBox: EditText
@@ -30,6 +33,7 @@ class MainActivity : Activity() {
     private lateinit var lastTv: TextView
     private lateinit var pctTv: TextView
     private lateinit var startBtn: Button
+    private lateinit var disconnectBtn: Button
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -77,6 +81,12 @@ class MainActivity : Activity() {
         setOnClickListener { onClick() }
     }
 
+    private fun listenerOn(): Boolean {
+        val s = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+            ?: return false
+        return s.contains(packageName)
+    }
+
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -85,11 +95,50 @@ class MainActivity : Activity() {
         root.addView(tv("Cutoff", 32f, true))
         root.addView(tv("Skips each Spotify song once it reaches the percentage you choose.", 15f))
 
-        // Setup screen
+        // Mode switch
+        val modeSwitch = Switch(this).apply {
+            text = "Notification mode (read Spotify on this phone)"
+            textSize = 16f
+            setPadding(0, 0, 0, dp(8))
+            isChecked = Mode.isLocal(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                Mode.setLocal(this@MainActivity, checked)
+                refresh()
+            }
+        }
+        root.addView(modeSwitch)
+        root.addView(
+            tv(
+                "On: reads Spotify's player on this phone. No login or internet needed. " +
+                    "It only looks at Spotify's player, never the text of your notifications.\n" +
+                    "Off: asks Spotify's servers. Needs the login below.", 13f
+            )
+        )
+
+        // Notification access help (shown only when needed)
+        accessBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        accessBox.addView(
+            tv(
+                "Notification access is off. Tap the first button and switch Cutoff on. " +
+                    "If the switch is greyed out or says \"Restricted setting\", tap the second " +
+                    "button, open the ⋮ menu at the top right, choose \"Allow restricted settings\", " +
+                    "then try the first button again.", 14f
+            )
+        )
+        accessBox.addView(btn("Allow notification access") {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        })
+        accessBox.addView(btn("Open Cutoff's app info") {
+            startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+            )
+        })
+
+        // Server login setup
         setup = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         setup.addView(
             tv(
-                "One-time setup: in your Spotify developer dashboard, add this Redirect URI " +
+                "Server mode setup: in your Spotify developer dashboard, add this Redirect URI " +
                     "to your app: cutoff://callback\n\nThen paste your Client ID below.", 15f
             )
         )
@@ -109,7 +158,7 @@ class MainActivity : Activity() {
             }
         })
 
-        // Main screen
+        // Main controls
         main = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         statusTv = tv("Stopped", 18f, true)
         lastTv = tv("", 14f)
@@ -127,6 +176,10 @@ class MainActivity : Activity() {
             })
         }
         startBtn = btn("Start") { toggleService() }
+        disconnectBtn = btn("Disconnect Spotify login") {
+            Spotify.logout()
+            refresh()
+        }
 
         main.addView(statusTv)
         main.addView(lastTv)
@@ -136,12 +189,9 @@ class MainActivity : Activity() {
         main.addView(btn("Battery settings (set to Unrestricted)") {
             startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
         })
-        main.addView(btn("Disconnect Spotify") {
-            stopService(Intent(this, SkipService::class.java))
-            Spotify.logout()
-            refresh()
-        })
+        main.addView(disconnectBtn)
 
+        root.addView(accessBox)
         root.addView(setup)
         root.addView(main)
         setContentView(ScrollView(this).apply { addView(root) })
@@ -180,9 +230,12 @@ class MainActivity : Activity() {
     }
 
     private fun refresh() {
+        val local = Mode.isLocal(this)
         val logged = Spotify.loggedIn
-        setup.visibility = if (logged) View.GONE else View.VISIBLE
-        main.visibility = if (logged) View.VISIBLE else View.GONE
+        accessBox.visibility = if (local && !listenerOn()) View.VISIBLE else View.GONE
+        setup.visibility = if (!local && !logged) View.VISIBLE else View.GONE
+        main.visibility = if (local || logged) View.VISIBLE else View.GONE
+        disconnectBtn.visibility = if (logged) View.VISIBLE else View.GONE
         statusTv.text = if (SkipService.running) Spotify.status else "Stopped"
         lastTv.text = Spotify.lastSkip
         startBtn.text = if (SkipService.running) "Stop" else "Start"

@@ -35,6 +35,13 @@ class MainActivity : Activity() {
     private lateinit var startBtn: Button
     private lateinit var disconnectBtn: Button
 
+    private lateinit var lfBox: LinearLayout
+    private lateinit var lfSetup: LinearLayout
+    private lateinit var lfStatus: TextView
+    private lateinit var lfKey: EditText
+    private lateinit var lfSecret: EditText
+    private lateinit var lfDisc: Button
+
     private val ticker = object : Runnable {
         override fun run() {
             refresh()
@@ -45,6 +52,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Spotify.init(this)
+        Lastfm.init(this)
         buildUi()
         handleIntent(intent)
         refresh()
@@ -114,6 +122,92 @@ class MainActivity : Activity() {
                     "Off: asks Spotify's servers. Needs the login below.", 13f
             )
         )
+
+        // Last.fm
+        val lfSwitch = Switch(this).apply {
+            text = "Scrobble to Last.fm"
+            textSize = 16f
+            setPadding(0, dp(8), 0, dp(8))
+            isChecked = Lastfm.enabled
+            setOnCheckedChangeListener { _, checked ->
+                Lastfm.enabled = checked
+                refresh()
+            }
+        }
+        root.addView(lfSwitch)
+
+        lfBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        lfStatus = tv("", 14f, true)
+        lfBox.addView(lfStatus)
+        lfBox.addView(
+            tv(
+                "Turn off Spotify's own Last.fm link, the Last.fm app and Pano Scrobbler, " +
+                    "or plays will be counted twice. Songs only count when you hear at least half, " +
+                    "so keep the cutoff at 50% or higher.", 13f
+            )
+        )
+
+        lfSetup = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        lfSetup.addView(
+            tv(
+                "Create a free key at last.fm/api/account/create (any name, leave the callback " +
+                    "blank), then paste the API key and Shared secret here.", 14f
+            )
+        )
+        lfKey = EditText(this).apply {
+            hint = "Last.fm API key"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setSingleLine()
+            setText(Lastfm.apiKey)
+        }
+        lfSecret = EditText(this).apply {
+            hint = "Last.fm Shared secret"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setSingleLine()
+            setText(Lastfm.secret)
+        }
+        lfSetup.addView(lfKey)
+        lfSetup.addView(lfSecret)
+        lfSetup.addView(btn("1. Connect Last.fm") {
+            val k = lfKey.text.toString().trim()
+            val s = lfSecret.text.toString().trim()
+            if (k.isEmpty() || s.isEmpty()) {
+                toast("Paste both the API key and the Shared secret.")
+            } else {
+                Lastfm.apiKey = k
+                Lastfm.secret = s
+                Thread {
+                    val token = Lastfm.getToken()
+                    runOnUiThread {
+                        if (token == null) {
+                            toast(Lastfm.note)
+                        } else {
+                            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(Lastfm.authUrl(token))))
+                        }
+                    }
+                }.start()
+            }
+        })
+        lfSetup.addView(
+            tv("Allow Cutoff on the Last.fm page, then come back here.", 13f)
+        )
+        lfSetup.addView(btn("2. I've allowed it, finish") {
+            Thread {
+                val ok = Lastfm.finishAuth()
+                runOnUiThread {
+                    toast(if (ok) "Last.fm connected." else Lastfm.note)
+                    refresh()
+                }
+            }.start()
+        })
+        lfBox.addView(lfSetup)
+
+        lfDisc = btn("Disconnect Last.fm") {
+            Lastfm.disconnect()
+            refresh()
+        }
+        lfBox.addView(lfDisc)
+        root.addView(lfBox)
 
         // Notification access help (shown only when needed)
         accessBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -239,5 +333,16 @@ class MainActivity : Activity() {
         statusTv.text = if (SkipService.running) Spotify.status else "Stopped"
         lastTv.text = Spotify.lastSkip
         startBtn.text = if (SkipService.running) "Stop" else "Start"
+
+        val lf = Lastfm.enabled
+        val lfOn = Lastfm.connected
+        lfBox.visibility = if (lf) View.VISIBLE else View.GONE
+        lfSetup.visibility = if (lfOn) View.GONE else View.VISIBLE
+        lfDisc.visibility = if (lfOn) View.VISIBLE else View.GONE
+        if (lf) {
+            val head = if (lfOn) "Connected as ${Lastfm.user}. Waiting to send: ${Lastfm.pending}"
+            else "Not connected"
+            lfStatus.text = head + (if (Lastfm.note.isNotEmpty()) "\n" + Lastfm.note else "")
+        }
     }
 }

@@ -36,10 +36,18 @@ class SkipService : Service() {
     private var idleSince = System.currentTimeMillis()
     private var active = false
 
+    // Scrobble tracking
+    private var curId: String? = null
+    private var curStart = 0L
+    private var scrobbledId: String? = null
+    private var lastPos = 0L
+    private var nextFlush = 0L
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Spotify.init(this)
+        Lastfm.init(this)
         val channelId = "cutoff"
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
@@ -119,6 +127,16 @@ class SkipService : Service() {
                 sleep = 5000L
             }
 
+            try {
+                if (Lastfm.enabled && Lastfm.connected && Lastfm.pending > 0 &&
+                    System.currentTimeMillis() >= nextFlush
+                ) {
+                    Lastfm.flush()
+                    nextFlush = System.currentTimeMillis() + 20000L
+                }
+            } catch (e: Exception) {
+            }
+
             hold(active)
 
             if (!active && System.currentTimeMillis() - idleSince > 2 * 60 * 60 * 1000L) {
@@ -135,10 +153,13 @@ class SkipService : Service() {
         }
     }
 
-    // Shared decision logic for both modes. Returns how long to sleep.
+    // Shared logic for both modes. Returns how long to sleep.
     private fun decide(
         id: String,
         name: String,
+        artist: String,
+        album: String,
+        dur: Long,
         pos: Long,
         cut: Long,
         playing: Boolean,
@@ -153,6 +174,24 @@ class SkipService : Service() {
             return 10000L
         }
         markActive()
+
+        // A new song, or the same song starting over
+        if (curId != id || (pos < 5000 && lastPos > 15000)) {
+            curId = id
+            curStart = System.currentTimeMillis() / 1000 - pos / 1000
+            scrobbledId = null
+        }
+        lastPos = pos
+
+        // Last.fm rule: half the song, or 4 minutes, and the song must be over 30 seconds
+        val thr = minOf(dur / 2, 240000L)
+        val canScrobble = Lastfm.enabled && Lastfm.connected && dur >= 30000L
+        if (canScrobble && scrobbledId != id && pos >= thr - 1500L) {
+            scrobbledId = id
+            Lastfm.scrobble(artist, name, album, curStart, dur / 1000)
+            nextFlush = 0L
+        }
+
         if (id == skippedId) {
             setStatus("Skipping…")
             return 1000L
@@ -167,11 +206,16 @@ class SkipService : Service() {
         }
         val tag = if (fast) "Watching (notification mode)" else "Watching (server mode)"
         setStatus("$tag: $name (skips at ${fmt(cut)})")
-        return if (fast) {
-            if (remaining > 5300L) 5000L else maxOf(100L, remaining - 150L)
-        } else {
-            if (remaining > 10300L) 10000L else maxOf(200L, remaining - 300L)
+
+        val cap = if (fast) 3000L else 10000L
+        val lead = if (fast) 150L else 300L
+        val floor = if (fast) 100L else 200L
+        var s = minOf(cap, maxOf(floor, remaining - lead))
+        if (canScrobble && scrobbledId != id) {
+            val toScrobble = thr - pos
+            if (toScrobble > 0) s = minOf(s, maxOf(100L, toScrobble))
         }
+        return s
     }
 
     // ---------- Local mode: read Spotify's media player on this phone ----------
@@ -200,6 +244,9 @@ class SkipService : Service() {
         val buffering = st.state == PlaybackState.STATE_BUFFERING
         val dur = md.getLong(MediaMetadata.METADATA_KEY_DURATION)
         val name = md.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Unknown"
+        val artist = md.getString(MediaMetadata.METADATA_KEY_ARTIST)
+            ?: md.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST) ?: ""
+        val album = md.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
         val id = md.getString(MediaMetadata.METADATA_KEY_MEDIA_ID) ?: (name + dur)
 
         if (buffering) {
@@ -227,7 +274,7 @@ class SkipService : Service() {
         if (dur > 0 && pos > dur) pos = dur
         val cut = dur * Spotify.percent / 100
 
-        return decide(id, name, pos, cut, playing, true) {
+        return decide(id, name, artist, album, dur, pos, cut, playing, true) {
             c.transportControls.skipToNext()
             null
         }
@@ -274,8 +321,11 @@ class SkipService : Service() {
         val dur = item.optLong("duration_ms")
         val pos = j.optLong("progress_ms")
         val cut = dur * Spotify.percent / 100
+        val arr = item.optJSONArray("artists")
+        val artist = if (arr != null && arr.length() > 0) arr.getJSONObject(0).optString("name") else ""
+        val album = item.optJSONObject("album")?.optString("name") ?: ""
 
-        return decide(id, name, pos, cut, playing, false) {
+        return decide(id, name, artist, album, dur, pos, cut, playing, false) {
             val s = Spotify.api("POST", "/me/player/next")
             when (s.code) {
                 200, 204 -> null

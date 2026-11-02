@@ -36,11 +36,12 @@ class MainActivity : Activity() {
     private lateinit var disconnectBtn: Button
 
     private lateinit var lfBox: LinearLayout
-    private lateinit var lfSetup: LinearLayout
+    private lateinit var lfList: LinearLayout
+    private lateinit var lfAdd: LinearLayout
     private lateinit var lfStatus: TextView
     private lateinit var lfKey: EditText
     private lateinit var lfSecret: EditText
-    private lateinit var lfDisc: Button
+    private var lfSig = ""
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -141,17 +142,21 @@ class MainActivity : Activity() {
         lfBox.addView(lfStatus)
         lfBox.addView(
             tv(
-                "Turn off Spotify's own Last.fm link, the Last.fm app and Pano Scrobbler, " +
-                    "or plays will be counted twice. Songs only count when you hear at least half, " +
-                    "so keep the cutoff at 50% or higher.", 13f
+                "Every play is sent to all the accounts below. Turn off Spotify's own Last.fm link, " +
+                    "the Last.fm app and Pano Scrobbler, or plays will be counted twice. Songs only " +
+                    "count when you hear at least half, so keep the cutoff at 50% or higher.", 13f
             )
         )
 
-        lfSetup = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        lfSetup.addView(
+        lfList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        lfBox.addView(lfList)
+
+        lfAdd = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        lfAdd.addView(
             tv(
-                "Create a free key at last.fm/api/account/create (any name, leave the callback " +
-                    "blank), then paste the API key and Shared secret here.", 14f
+                "Add an account. Create a free key at last.fm/api/account/create (any name, " +
+                    "leave the callback blank), then paste the API key and Shared secret here. " +
+                    "The same key works for every account.", 14f
             )
         )
         lfKey = EditText(this).apply {
@@ -166,9 +171,16 @@ class MainActivity : Activity() {
             setSingleLine()
             setText(Lastfm.secret)
         }
-        lfSetup.addView(lfKey)
-        lfSetup.addView(lfSecret)
-        lfSetup.addView(btn("1. Connect Last.fm") {
+        lfAdd.addView(lfKey)
+        lfAdd.addView(lfSecret)
+        lfAdd.addView(
+            tv(
+                "To add a different account, first log in to that account on last.fm in your " +
+                    "browser (log out of the previous one, or use a private tab). The Last.fm page " +
+                    "allows whichever account is logged in.", 13f
+            )
+        )
+        lfAdd.addView(btn("1. Add a Last.fm account") {
             val k = lfKey.text.toString().trim()
             val s = lfSecret.text.toString().trim()
             if (k.isEmpty() || s.isEmpty()) {
@@ -188,25 +200,17 @@ class MainActivity : Activity() {
                 }.start()
             }
         })
-        lfSetup.addView(
-            tv("Allow Cutoff on the Last.fm page, then come back here.", 13f)
-        )
-        lfSetup.addView(btn("2. I've allowed it, finish") {
+        lfAdd.addView(tv("Allow Cutoff on the Last.fm page, then come back here.", 13f))
+        lfAdd.addView(btn("2. I've allowed it, finish") {
             Thread {
                 val ok = Lastfm.finishAuth()
                 runOnUiThread {
-                    toast(if (ok) "Last.fm connected." else Lastfm.note)
+                    toast(if (ok) "Last.fm account added." else Lastfm.note)
                     refresh()
                 }
             }.start()
         })
-        lfBox.addView(lfSetup)
-
-        lfDisc = btn("Disconnect Last.fm") {
-            Lastfm.disconnect()
-            refresh()
-        }
-        lfBox.addView(lfDisc)
+        lfBox.addView(lfAdd)
         root.addView(lfBox)
 
         // Notification access help (shown only when needed)
@@ -323,6 +327,20 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    // Rebuilds the list of Last.fm accounts (only when it changes).
+    private fun rebuildAccounts() {
+        lfList.removeAllViews()
+        val list = Lastfm.accountList()
+        for ((i, p) in list.withIndex()) {
+            val label = if (p.second) "${p.first} (needs adding again)" else p.first
+            lfList.addView(tv(label, 15f, true))
+            lfList.addView(btn("Remove ${p.first}") {
+                Lastfm.removeAccount(i)
+                refresh()
+            })
+        }
+    }
+
     private fun refresh() {
         val local = Mode.isLocal(this)
         val logged = Spotify.loggedIn
@@ -335,13 +353,17 @@ class MainActivity : Activity() {
         startBtn.text = if (SkipService.running) "Stop" else "Start"
 
         val lf = Lastfm.enabled
-        val lfOn = Lastfm.connected
         lfBox.visibility = if (lf) View.VISIBLE else View.GONE
-        lfSetup.visibility = if (lfOn) View.GONE else View.VISIBLE
-        lfDisc.visibility = if (lfOn) View.VISIBLE else View.GONE
         if (lf) {
-            val head = if (lfOn) "Connected as ${Lastfm.user}. Waiting to send: ${Lastfm.pending}"
-            else "Not connected"
+            val sig = Lastfm.accountList().joinToString("|") { it.first + it.second }
+            if (sig != lfSig) {
+                lfSig = sig
+                rebuildAccounts()
+            }
+            lfAdd.visibility =
+                if (Lastfm.accountCount >= Lastfm.MAX_ACCOUNTS) View.GONE else View.VISIBLE
+            val head = "Accounts: ${Lastfm.accountCount} of ${Lastfm.MAX_ACCOUNTS}. " +
+                "Waiting to send: ${Lastfm.pending}"
             lfStatus.text = head + (if (Lastfm.note.isNotEmpty()) "\n" + Lastfm.note else "")
         }
     }

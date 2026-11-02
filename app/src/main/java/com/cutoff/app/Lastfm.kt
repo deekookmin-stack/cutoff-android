@@ -10,13 +10,31 @@ import java.net.URLEncoder
 import java.security.MessageDigest
 
 object Lastfm {
+    const val MAX_ACCOUNTS = 5
     private lateinit var prefs: SharedPreferences
     private const val ENDPOINT = "https://ws.audioscrobbler.com/2.0/"
 
     fun init(ctx: Context) {
         if (!::prefs.isInitialized) {
             prefs = ctx.applicationContext.getSharedPreferences("cutoff", Context.MODE_PRIVATE)
+            migrate()
         }
+    }
+
+    // Moves the old single account into the new list.
+    @Synchronized
+    private fun migrate() {
+        val old = prefs.getString("lf_session", "") ?: ""
+        if (old.isNotEmpty() && !prefs.contains("lf_accts")) {
+            val q = try { JSONArray(prefs.getString("lf_q", "[]")) } catch (e: Exception) { JSONArray() }
+            val o = JSONObject()
+                .put("u", prefs.getString("lf_user", "") ?: "")
+                .put("sk", old)
+                .put("bad", false)
+                .put("q", q)
+            prefs.edit().putString("lf_accts", JSONArray().put(o).toString()).apply()
+        }
+        prefs.edit().remove("lf_session").remove("lf_q").apply()
     }
 
     var apiKey: String
@@ -27,10 +45,6 @@ object Lastfm {
         get() = prefs.getString("lf_secret", "") ?: ""
         set(v) { prefs.edit().putString("lf_secret", v).apply() }
 
-    var user: String
-        get() = prefs.getString("lf_user", "") ?: ""
-        set(v) { prefs.edit().putString("lf_user", v).apply() }
-
     var enabled: Boolean
         get() = prefs.getBoolean("lf_on", false)
         set(v) { prefs.edit().putBoolean("lf_on", v).apply() }
@@ -39,18 +53,77 @@ object Lastfm {
         get() = prefs.getString("lf_note", "") ?: ""
         set(v) { prefs.edit().putString("lf_note", v).apply() }
 
-    private var session: String
-        get() = prefs.getString("lf_session", "") ?: ""
-        set(v) { prefs.edit().putString("lf_session", v).apply() }
+    // ---------- Accounts ----------
 
+    @Synchronized
+    private fun accounts(): JSONArray =
+        try { JSONArray(prefs.getString("lf_accts", "[]")) } catch (e: Exception) { JSONArray() }
+
+    @Synchronized
+    private fun saveAccounts(a: JSONArray) {
+        prefs.edit().putString("lf_accts", a.toString()).apply()
+    }
+
+    val accountCount: Int
+        get() = accounts().length()
+
+    // True if at least one account is logged in and working.
     val connected: Boolean
-        get() = session.isNotEmpty()
+        get() {
+            val a = accounts()
+            for (i in 0 until a.length()) {
+                if (!a.getJSONObject(i).optBoolean("bad")) return true
+            }
+            return false
+        }
 
-    fun disconnect() {
-        session = ""
-        user = ""
-        note = ""
-        prefs.edit().remove("lf_token").apply()
+    val pending: Int
+        get() {
+            val a = accounts()
+            var n = 0
+            for (i in 0 until a.length()) {
+                n += a.getJSONObject(i).optJSONArray("q")?.length() ?: 0
+            }
+            return n
+        }
+
+    // Name and "needs reconnecting" flag for each account.
+    fun accountList(): List<Pair<String, Boolean>> {
+        val a = accounts()
+        val out = ArrayList<Pair<String, Boolean>>()
+        for (i in 0 until a.length()) {
+            val o = a.getJSONObject(i)
+            out.add(Pair(o.optString("u"), o.optBoolean("bad")))
+        }
+        return out
+    }
+
+    @Synchronized
+    fun removeAccount(index: Int) {
+        val a = accounts()
+        val out = JSONArray()
+        for (i in 0 until a.length()) {
+            if (i != index) out.put(a.get(i))
+        }
+        saveAccounts(out)
+    }
+
+    @Synchronized
+    private fun addAccount(name: String, sk: String): Boolean {
+        val a = accounts()
+        var idx = -1
+        for (i in 0 until a.length()) {
+            if (a.getJSONObject(i).optString("u").equals(name, ignoreCase = true)) idx = i
+        }
+        if (idx < 0 && a.length() >= MAX_ACCOUNTS) {
+            note = "You can add up to $MAX_ACCOUNTS accounts. Remove one first."
+            return false
+        }
+        val o = if (idx >= 0) a.getJSONObject(idx) else JSONObject().put("q", JSONArray())
+        o.put("u", name).put("sk", sk).put("bad", false)
+        if (idx < 0) a.put(o)
+        saveAccounts(a)
+        return true
     }
 
     // ---------- Talking to Last.fm ----------
@@ -123,48 +196,43 @@ object Lastfm {
             note = errText(code, j)
             return false
         }
-        session = s.optString("key")
-        user = s.optString("name")
+        val name = s.optString("name")
+        val ok = addAccount(name, s.optString("key"))
         prefs.edit().remove("lf_token").apply()
-        note = "Connected."
-        return true
+        if (ok) note = "Connected: $name"
+        return ok
     }
 
-    // ---------- Queue ----------
+    // ---------- Scrobbling ----------
 
+    // Called by the skip service. Saves locally for every account, so it is instant.
     @Synchronized
-    private fun queue(): JSONArray =
-        try { JSONArray(prefs.getString("lf_q", "[]")) } catch (e: Exception) { JSONArray() }
-
-    @Synchronized
-    private fun saveQueue(a: JSONArray) {
-        prefs.edit().putString("lf_q", a.toString()).apply()
-    }
-
-    val pending: Int
-        get() = queue().length()
-
-    // Called by the skip service. This only saves locally, so it is instant.
     fun scrobble(artist: String, track: String, album: String, ts: Long, durSec: Long) {
-        if (!enabled || !connected || artist.isBlank() || track.isBlank()) return
-        val a = queue()
-        a.put(
-            JSONObject().put("a", artist).put("t", track).put("al", album)
-                .put("ts", ts).put("d", durSec)
-        )
-        val out = JSONArray()
-        for (i in maxOf(0, a.length() - 200) until a.length()) out.put(a.get(i))
-        saveQueue(out)
+        if (!enabled || artist.isBlank() || track.isBlank()) return
+        val a = accounts()
+        if (a.length() == 0) return
+        for (i in 0 until a.length()) {
+            val acct = a.getJSONObject(i)
+            val q = acct.optJSONArray("q") ?: JSONArray()
+            q.put(
+                JSONObject().put("a", artist).put("t", track).put("al", album)
+                    .put("ts", ts).put("d", durSec)
+            )
+            val trimmed = JSONArray()
+            for (k in maxOf(0, q.length() - 200) until q.length()) trimmed.put(q.get(k))
+            acct.put("q", trimmed)
+        }
+        saveAccounts(a)
     }
 
-    // 0 = sent, 1 = rejected for good (drop it), 2 = try again later
-    private fun send(o: JSONObject): Int {
+    // 0 = sent, 1 = rejected for good (drop it), 2 = try again later, 3 = login expired
+    private fun send(sk: String, o: JSONObject, user: String): Int {
         val p = mutableMapOf(
             "method" to "track.scrobble",
             "artist" to o.optString("a"),
             "track" to o.optString("t"),
             "timestamp" to o.optLong("ts").toString(),
-            "sk" to session
+            "sk" to sk
         )
         val al = o.optString("al")
         if (al.isNotEmpty()) p["album"] = al
@@ -179,27 +247,51 @@ object Lastfm {
             return 0
         }
         if (err == 9 || err == 4) {
-            session = ""
-            note = "Last.fm login expired. Connect again."
-            return 2
+            note = "Last.fm login expired for $user. Add that account again."
+            return 3
         }
         if (err == 11 || err == 16 || err == 29 || code >= 500) return 2
         note = errText(code, j)
         return 1
     }
 
-    fun flush() {
-        if (!enabled || !connected) return
-        var a = queue()
-        var sent = 0
-        while (a.length() > 0 && sent < 10) {
-            val r = send(a.getJSONObject(0))
-            if (r == 2) break
+    // Drops the first `dropped` plays from one account's queue and updates its state.
+    @Synchronized
+    private fun applyResult(user: String, dropped: Int, bad: Boolean) {
+        val a = accounts()
+        for (i in 0 until a.length()) {
+            val acct = a.getJSONObject(i)
+            if (acct.optString("u") != user) continue
+            val q = acct.optJSONArray("q") ?: JSONArray()
             val rest = JSONArray()
-            for (i in 1 until a.length()) rest.put(a.get(i))
-            a = rest
-            sent++
+            for (k in dropped until q.length()) rest.put(q.get(k))
+            acct.put("q", rest)
+            if (bad) acct.put("bad", true)
         }
-        saveQueue(a)
+        saveAccounts(a)
+    }
+
+    fun flush() {
+        if (!enabled) return
+        val snap = accounts()
+        for (i in 0 until snap.length()) {
+            val acct = snap.getJSONObject(i)
+            if (acct.optBoolean("bad")) continue
+            val user = acct.optString("u")
+            val sk = acct.optString("sk")
+            val q = acct.optJSONArray("q") ?: continue
+            var done = 0
+            var bad = false
+            while (done < q.length() && done < 10) {
+                val r = send(sk, q.getJSONObject(done), user)
+                if (r == 2) break
+                if (r == 3) {
+                    bad = true
+                    break
+                }
+                done++
+            }
+            if (done > 0 || bad) applyResult(user, done, bad)
+        }
     }
 }
